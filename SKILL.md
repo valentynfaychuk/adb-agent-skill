@@ -27,12 +27,23 @@ The last two are only required for the voice message workflow. All other automat
 
 ### Always Start With Device Setup
 
-Before any automation session, optimize the device for reliable ADB control:
+Before any automation session, optimize the device for reliable ADB control.
+
+**Best practice — rotation lock first.** Lock portrait orientation as the very first step, even before checking `adb devices`. UI automation breaks the moment the screen rotates mid-session (taps land on wrong coordinates, uiautomator bounds become stale). The two `settings put` lines below are safe to run blind — they no-op if already set:
+
+```bash
+adb shell settings put system accelerometer_rotation 0
+adb shell settings put system user_rotation 0
+```
+
+Run them without `-s $DEVICE` if there's only one device attached — saves a step. If the user pre-runs these for you (common when delegating ADB tasks), don't re-run them.
+
+Then continue with the rest of session setup:
 
 ```bash
 DEVICE="<your-device-serial>"  # Find with: adb devices -l
 
-# Lock portrait orientation
+# Lock portrait orientation (also done above; re-stating with explicit -s for multi-device hosts)
 adb -s $DEVICE shell settings put system accelerometer_rotation 0
 adb -s $DEVICE shell settings put system user_rotation 0
 
@@ -187,9 +198,75 @@ adb -s $DEVICE shell input text "hello"
 # Spaces use %s
 adb -s $DEVICE shell input text "hello%sworld"
 
-# LIMITATION: Cyrillic/Unicode does NOT work with input text
-# Use intent-based approaches for non-ASCII (see Voice Messages section)
+# LIMITATION: Cyrillic/Unicode/emoji do NOT work with `input text`.
+# For Unicode and emoji, install ADBKeyBoard once and use the broadcast
+# pattern (see "Unicode & Emoji Input via ADBKeyBoard" below).
 ```
+
+### Unicode & Emoji Input via ADBKeyBoard
+
+`adb shell input text` is ASCII-only. For Cyrillic, CJK, accented characters, or
+emoji in any focused text field, install [ADBKeyBoard](https://github.com/senzhk/ADBKeyBoard)
+— a virtual IME that accepts text via broadcast intents.
+
+#### One-Time Install
+
+```bash
+# Download (or use a local copy)
+curl -L -o /tmp/ADBKeyBoard.apk \
+    https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.apk
+
+adb -s $DEVICE install /tmp/ADBKeyBoard.apk
+adb -s $DEVICE shell ime enable com.android.adbkeyboard/.AdbIME
+adb -s $DEVICE shell ime set com.android.adbkeyboard/.AdbIME
+```
+
+While ADBKeyBoard is the active IME, a thin "ADB Keyboard {ON}" bar shows at
+the bottom of the screen and the regular soft keyboard does not appear — taps
+on text fields focus them but the user cannot type by hand. Switch back when
+done (see Teardown).
+
+#### Type Text (Including Emoji, Cyrillic, CJK)
+
+```bash
+# Tap the target text field first to focus it, then broadcast:
+adb -s $DEVICE shell "am broadcast -a ADB_INPUT_TEXT --es msg \"hey what's up 🔥 Привіт\""
+```
+
+**Quoting rules** — the inner string is parsed by the device shell, so:
+- Wrap the whole `am broadcast ...` in double quotes for the host shell
+- Escape the `--es msg` value's double quotes (`\"...\"`) for the device shell
+- Single quotes inside the value (`what's`) work without extra escaping
+- If the value contains both single and double quotes, or shell metacharacters
+  that survive escaping, use `ADB_INPUT_B64` with a base64-encoded payload:
+  ```bash
+  MSG=$(printf '%s' "tricky 'mixed' \"quotes\" 🚀" | base64)
+  adb -s $DEVICE shell "am broadcast -a ADB_INPUT_B64 --es msg '$MSG'"
+  ```
+
+#### Other Useful Broadcasts
+
+```bash
+# Clear the focused text field (alternative to a backspace loop)
+adb -s $DEVICE shell am broadcast -a ADB_CLEAR_TEXT
+
+# Send IME editor actions (Go, Search, Send, Next, Done)
+# Common codes: 2=Go, 3=Search, 4=Send, 5=Next, 6=Done
+adb -s $DEVICE shell am broadcast -a ADB_EDITOR_CODE --ei code 4
+```
+
+#### Teardown — Restore the Normal Keyboard
+
+```bash
+# Switch back to the user's preferred IME (Gboard on most devices)
+adb -s $DEVICE shell ime set com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+
+# Or list installed IMEs and pick one
+adb -s $DEVICE shell ime list -s
+```
+
+**Always restore the original IME before ending an automation session** —
+otherwise the user is left with a phone they can't type on by hand.
 
 ### Key Events
 
@@ -296,7 +373,18 @@ adb -s $DEVICE shell input tap <send_x> <send_y>
 
 ### Send Non-ASCII Text (Ukrainian, etc.)
 
-Use Android's share intent — it handles Unicode properly:
+**Preferred:** install ADBKeyBoard (see "Unicode & Emoji Input via ADBKeyBoard"
+above), tap the chat's message field to focus it, then broadcast the text:
+
+```bash
+adb -s $DEVICE shell "am broadcast -a ADB_INPUT_TEXT --es msg \"Привіт! Як справи? 🙂\""
+adb -s $DEVICE shell input tap <send_x> <send_y>
+```
+
+This works inside an already-open chat — no contact picker, no extra taps.
+
+**Alternative (no ADBKeyBoard):** Android's share intent also handles Unicode,
+but pops a chat picker each time:
 
 ```bash
 adb -s $DEVICE shell "am start -a android.intent.action.SEND \
@@ -305,7 +393,7 @@ adb -s $DEVICE shell "am start -a android.intent.action.SEND \
     -p org.telegram.messenger"
 ```
 
-This opens a chat picker. Search for the contact, select them, and tap send.
+Search for the contact, select them, and tap send.
 
 ### Delete Messages
 
@@ -543,8 +631,10 @@ adb -s $DEVICE shell monkey -p <package> -c android.intent.category.LAUNCHER 1
 ### Can't Type Non-ASCII Text
 
 - `adb shell input text` only supports ASCII
-- Use share intents for Unicode text
-- For clipboard-based approaches, consider ADBKeyboard or similar input methods
+- Install ADBKeyBoard and use `am broadcast -a ADB_INPUT_TEXT --es msg "..."`
+  for any Unicode/emoji input — see "Unicode & Emoji Input via ADBKeyBoard"
+- Share intents (`android.intent.action.SEND`) handle Unicode too but require
+  the receiving app to render a chat picker each time
 
 ### uiautomator Dump Fails or Returns Empty
 
@@ -559,3 +649,102 @@ adb -s $DEVICE shell monkey -p <package> -c android.intent.category.LAUNCHER 1
 - Navigate back to the expected screen manually
 
 For detailed ADB reference, see `references/commands.md`.
+
+---
+
+## Lessons Learned
+
+### Screenshot Economy (CRITICAL when delegating to subagents)
+
+The Read tool keeps each screenshot image in the agent's context. Subagents posting many UI updates can crash with `An image in the conversation exceeds the dimension limit for many-image requests` after ~30-50 screenshots accumulate.
+
+**Rules:**
+- **Reuse one filename**, e.g. `/tmp/x.png`, and overwrite it every time. Do NOT use sequential names like `screen_01.png`, `screen_02.png` — sequential names are tempting for "audit trail" but they balloon image context.
+- **Cap screenshots per logical action** — at most one before, one after. If you find yourself screenshotting 3+ times for one tap, you're being too cautious.
+- **Skip screenshots when you can act blindly from prior knowledge** — after a known-stable navigation (e.g., a deeplink that always lands on the same screen), just proceed.
+- **Prefer `uiautomator dump` + parse over screenshot + read** when you only need to find a button — the XML costs zero image context.
+- For long automation runs in a subagent, set an explicit budget in the prompt: "keep total tool uses under 70" + "use one reusable screenshot path".
+
+### Chain Dependent Bash Calls
+
+Each separate `Bash` invocation is a tool use. When steps are deterministic and don't need intermediate verification, chain them with `&&`:
+
+```bash
+# Instead of 5 separate Bash calls:
+adb -s $DEVICE shell input tap 600 2463 && sleep 2 \
+    && MSG=$(printf '%s' "reply text" | base64) \
+    && adb -s $DEVICE shell "am broadcast -a ADB_INPUT_B64 --es msg '$MSG'" \
+    && sleep 1 \
+    && adb -s $DEVICE shell input tap 1057 2406 \
+    && sleep 3 \
+    && adb -s $DEVICE shell screencap -p /sdcard/x.png \
+    && adb -s $DEVICE pull /sdcard/x.png /tmp/x.png
+```
+
+This collapses a 6-step "tap reply → type → tap send → verify" sequence into one tool use. Cuts both context and wall time.
+
+### Always Use `ADB_INPUT_B64` for Non-Trivial Text
+
+`am broadcast -a ADB_INPUT_TEXT --es msg "..."` works for simple ASCII but the shell-quoting becomes a minefield with em dashes, smart quotes, mixed `'` and `"`, or shell metacharacters. **Default to base64 for any text containing punctuation:**
+
+```bash
+MSG=$(printf '%s' "the actual reply text — with em dash, 🙃, and 'quotes'" | base64)
+adb -s $DEVICE shell "am broadcast -a ADB_INPUT_B64 --es msg '$MSG'"
+```
+
+This sidesteps every quoting edge case. Reserve plain `ADB_INPUT_TEXT` only for known-ASCII-only strings.
+
+### IME Save/Restore Discipline
+
+When activating ADBKeyBoard, save the original IME to a file BEFORE switching, not just to a shell variable (variables die between Bash invocations):
+
+```bash
+adb -s $DEVICE shell settings get secure default_input_method > /tmp/original_ime.txt
+adb -s $DEVICE shell ime set com.android.adbkeyboard/.AdbIME
+```
+
+At end of session (mandatory, even on partial failure):
+```bash
+ORIG=$(cat /tmp/original_ime.txt | tr -d '[:space:]')
+[ -n "$ORIG" ] && adb -s $DEVICE shell ime set "$ORIG" \
+    || adb -s $DEVICE shell ime set com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME
+```
+
+Leaving ADBKeyBoard active means the user can't type on their phone manually — a real-world break. Treat IME restore like releasing a lock.
+
+### Verify Posts/Sends Beyond the Toast
+
+A "Reply sent" / "Sent" toast confirms the action succeeded but **does not prove you replied to the right thing**. Apps with QT'd / nested / embedded posts (X, Threads, Reddit) can show ambiguous detail views where the QT block looks like the parent post.
+
+**Verification ladder, cheapest first:**
+1. Check the secondary counter delta (likes 389 → 390, replies 5 → 6).
+2. Look for your own reply in the "Most relevant replies" or thread view — confirm the "Replying to @X" attribution line matches the intended target.
+3. Only as last resort: navigate to your profile's Replies tab.
+
+### X / Twitter Specific Patterns (1200x2670, com.twitter.android)
+
+**Deeplinks beat manual navigation:**
+- `twitter://lists` — opens the Lists screen
+- `twitter://user?screen_name=<handle>` — jumps directly to a profile (much faster than scrolling a timeline to find that user's post)
+- When a target post isn't visible after 3-4 scrolls in a list/timeline, jump to the author's profile instead of continuing to scroll
+
+**Posting a reply — fastest path:**
+1. Open the post detail (tap post body in timeline)
+2. Tap the inline "Post your reply" field at the bottom — bounds typically `[0,2400][1200,2526]`, center `(600, 2463)`. This is faster than tapping the speech-bubble icon at `(120, 1362)` which opens the full compose sheet.
+3. Type via `ADB_INPUT_B64` (field is auto-focused after tap).
+4. Tap inline Reply button at `[945,2358][1170,2454]`, center `(1057, 2406)`.
+
+The full compose sheet has its own REPLY button at top-right, around `(1051, 194)`. Use only when you specifically opened compose via the speech-bubble icon (e.g., to attach media).
+
+**Reply restrictions:**
+- Posts with "Only some accounts can reply" show a `Who can reply?` dialog when you tap the reply icon. The reply button is `clickable=true enabled=true` even when blocked — you can't pre-detect from uiautomator. Only the dialog reveals it. Detect via screenshot of the dialog text and skip the post; do NOT spam-tap.
+
+**QT'd posts confuse post detail view:**
+- When you open a post that QTs another post, scrolling down inside the detail view can make the QT'd post's metadata look like the main post's. Always confirm via the "Replying to @X" attribution on your sent reply — if `X` matches the OUTER (intended) author, you replied correctly regardless of what the detail header showed.
+
+**Encounter-order beats original-order for batch replies:**
+When you have N replies to draft across one timeline/list, walk top-to-bottom and post as you encounter each target. Re-finding posts by author after each send doubles your scroll cost.
+
+### Watch for "Subscribe" / "Follow" Buttons in Tap Zones
+
+X profile pages put a "Subscribe" or "Follow" button at top-right of the bio area, around `(940-1100, 180-260)`. Stray taps in that region during navigation can accidentally subscribe ($) or follow accounts. When tapping in the upper-right of a profile screen, always uiautomator-confirm bounds first.
